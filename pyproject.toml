@@ -1,0 +1,26 @@
+[project]
+name = "gurukul-ai"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Shiv kumar Jha", email = "shivkumarjha@techgropse.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.163.1",
+    "httpx>=0.28.1",
+    "langchain-core>=1.8.1",
+    "langgraph>=1.2.22",
+    "pydantic>=2.14.3",
+    "pydantic-settings>=2.16.3",
+    "redis>=8.1.0",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.scripts]
+gurukul-ai = "gurukul_ai:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
