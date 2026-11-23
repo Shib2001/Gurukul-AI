@@ -1297,35 +1297,58 @@ GET    /api/v1/conversations
 GET    /api/v1/conversations/{conversation_id}
 PATCH  /api/v1/conversations/{conversation_id}
 GET    /api/v1/conversations/{conversation_id}/messages
-POST   /api/v1/conversations/{conversation_id}/messages
-GET    /api/v1/conversations/{conversation_id}/stream
+POST   /api/v1/auth/ws-tickets
+WS     /api/v1/ws/conversations/{conversation_id}
 ```
 
-Message creation should accept:
+The browser uses HTTP for login, catalog, conversation creation, and saved
+history, then uses the authenticated backend WebSocket for live lesson
+interaction. The backend verifies the student and conversation ownership,
+persists each message, and calls the AI service; the browser never connects
+directly to this AI service. A short-lived, single-use WebSocket ticket is
+obtained over authenticated HTTP. Never put a long-lived student access token
+in the WebSocket URL; consume tickets once and redact them from access logs.
+
+The client sends `lesson.start` to request the opening lesson and
+`message.send` for text turns. Frames carry a stable client event/message ID
+for idempotent retry. The backend persists the user message and pending
+assistant message before invoking AI. Server events include `message.accepted`,
+`assistant.delta` when upstream streaming is available, `message.completed`,
+`message.failed`, and `error`. On disconnect, the backend completes or records
+the turn; the student can reconnect, load saved history, and retry with the
+same ID without creating duplicate messages.
 
 ```json
 {
-  "client_message_id": "client-msg-unique-value",
+  "type": "message.send",
+  "event_id": "7eb647be-2630-4e8c-a510-e889b714bc53",
+  "client_message_id": "7eb647be-2630-4e8c-a510-e889b714bc53",
   "content": "Can you explain fractions?",
-  "content_format": "text",
-  "stream": true
+  "content_format": "text"
 }
 ```
 
-The backend owns the server message ID and final status.
+The backend owns the server message ID and final status. Redis is for short
+ticket state, rate limits, exact idempotency, and cache data—not conversation
+memory or durable records.
 
 ### 8.4 Voice
 
 ```text
-POST   /api/v1/voice/sessions
-POST   /api/v1/voice/uploads
-GET    /api/v1/voice/jobs/{job_id}
+WS     /api/v1/ws/conversations/{conversation_id}
 GET    /api/v1/voice/audio/{audio_id}
 DELETE /api/v1/voice/audio/{audio_id}
 ```
 
-The upload response should not grant broad bucket access. Use a short-lived,
-object-specific signed URL or proxy the upload through a controlled endpoint.
+The first voice mode is turn-based on the same backend WebSocket. The browser
+sends a `voice.turn.start` event with a stable `client_turn_id` and an
+allow-listed audio format, streams bounded binary audio frames, then sends
+`voice.turn.end`. The backend forwards the audio to the AI service for
+transcription, sends the transcript through the same grade-aware lesson flow,
+and relays generated teacher audio. Persist the transcript and teacher text as
+conversation messages; raw student audio is transient and deleted by default.
+The AI service owns speech recognition and synthesis; the backend owns
+authentication, conversation state, and durable message persistence.
 
 ### 8.5 Quizzes and attempts
 
@@ -1397,14 +1420,84 @@ The AI service:
 
 ### 9.2 Internal request
 
-Conceptually:
+The backend calls `POST /internal/v1/chat/runs` over authenticated HTTP; this
+is not a browser-facing WebSocket endpoint. The browser connects only to the
+backend WebSocket, and the backend relays validated AI events to that client.
+For local development, the AI service base URL is `http://localhost:8001`;
+deployment must use a private network address or equivalent service-to-service
+protection. Authenticate the backend with
+`Authorization: Bearer <shared-service-key>`. Also send `X-Request-ID` and
+`Idempotency-Key` headers. The shared service key is a different secret from
+student access tokens; configure the same value as `AI_SERVICE_AUTH_KEY` in
+both repositories using out-of-band local/deployment secrets. The OpenRouter
+key remains exclusive to the AI service.
+
+The current backend implementation makes a normal HTTP request and expects one
+complete JSON response. Implement and test this JSON path first. The AI service
+must not expose provider credentials or accept student-browser connections.
+SSE streaming between backend and AI is a later phase and must be enabled only
+after the backend client is updated to request and parse that stream.
+
+The backend sends at most 12 recent messages in chronological order, including
+the current user message. Each message is text and has role `user` or
+`assistant`. Do not send full history. Grade is a decimal string from `"1"` to
+`"10"` in this internal contract; the backend validates it against the
+student's profile before sending it.
+
+Each published subject has exactly one teacher, so the student chooses a
+subject and the backend resolves its teacher. The database enforces one teacher
+per subject. The first active vertical slice is Mathematics:
+`subject_math` / `teacher_math`. Science and English can use the same
+one-teacher-per-subject contract when their teacher flows are enabled. The
+policy versions in the initial Maths example are `safety=1`, `teacher=math-3`,
+and `retrieval=2`.
+
+The first AI operation starts the lesson. The teacher should open in a
+grade-appropriate, friendly voice, introduce one manageable concept, explain
+it in short steps, then ask a simple check-for-understanding question. The
+opening is a lesson, not a generic "what do you want to learn?" greeting.
+Subsequent turns evaluate the student's reply as correct, partial, incorrect,
+or unclear. Respond supportively: correct answers advance to the next small
+concept and question; incorrect answers receive a simpler re-explanation and a
+new check; partial or unclear answers trigger a focused clarification. Avoid
+long monologues and ask one question at a time.
+
+Grade-aware prompts can start the first slice. Curated, approved, grade- and
+subject-filtered curriculum retrieval is part of Phase 2; use RAG when relevant
+approved material exists, not as a substitute for conversation history or
+student lesson state.
+
+The AI service returns lesson progression metadata for backend persistence:
+
+```json
+{
+  "topic": "Triangles",
+  "phase": "checking_understanding",
+  "understanding": "not_assessed",
+  "next_action": "ask_question"
+}
+```
+
+Allowed `phase` values are `teaching`, `checking_understanding`, and
+`completed`; allowed `understanding` values are `not_assessed`, `correct`,
+`partial`, `incorrect`, and `unclear`; allowed `next_action` values are
+`ask_question`, `continue`, `reteach`, `clarify`, and `complete`. These values
+are instructional state, not grades or scores. The backend remains the owner of
+durable messages and any future authoritative progress records.
+
+For `lesson_start`, send an empty `messages` array and omit `lesson_state`. For
+`lesson_turn`, send up to 12 bounded chronological messages ending with the
+student's current reply, plus the previously saved `lesson_state`. Never send
+unbounded conversation history.
+
+Request:
 
 ```json
 {
   "contract_version": "2026-01",
   "request_id": "req_01...",
   "idempotency_key": "chat_01...",
-  "operation": "tutor_chat",
+  "operation": "lesson_turn",
   "user_ref": "usr_opaque",
   "conversation_ref": "conv_opaque",
   "teacher_bot_id": "teacher_math",
@@ -1412,13 +1505,23 @@ Conceptually:
   "student_context": {
     "grade_level": "8",
     "language": "en",
-    "learning_preferences": ["step_by_step"]
+    "learning_preferences": []
   },
   "messages": [
     {
       "role": "user",
-      "content": "Explain fractions",
-      "created_at": "2026-11-07T17:30:00Z"
+      "content": "What is a fraction?",
+      "created_at": "2026-11-17T11:30:00Z"
+    },
+    {
+      "role": "assistant",
+      "content": "A fraction represents part of a whole.",
+      "created_at": "2026-11-17T11:30:04Z"
+    },
+    {
+      "role": "user",
+      "content": "Can you show me one?",
+      "created_at": "2026-11-17T11:31:00Z"
     }
   ],
   "limits": {
@@ -1433,8 +1536,42 @@ Conceptually:
 }
 ```
 
+Example `lesson_start` uses the same envelope with `"operation":
+"lesson_start"`, `"messages": []`, and no `lesson_state`.
+
+The AI service must validate the grade, teacher/subject pair, operation,
+message roles, context count and lengths, and requested budgets. The backend sets the output
+limit to at most 700 tokens and deadline to at most 20 seconds. The returned
+answer must be at most 4,000 characters so it can safely be used as bounded
+context on a later turn. Repeating an idempotency key with the same request
+must not start another provider run; reusing it with a different request must
+return a conflict.
+
+Use the AI service's Redis for a short-lived idempotency/result cache keyed by
+the idempotency key and validated against a hash of the full normalized
+request. Return the exact prior terminal response for a matching retry and a
+conflict for a key/body mismatch. Use a bounded TTL (24 hours initially) and
+include a deployment namespace. Cache entries are temporary run deduplication,
+not student memory; never key only by user text or share entries across
+conversations, users, grades, teachers, or languages. Cache approved retrieval
+results only with subject, grade, language, curriculum, query, and content
+version in the key. Never cache raw student audio. TTS audio may be cached only
+for an exact text, voice, language, and model-version match when it contains no
+student-specific or sensitive content. The backend database is the durable
+source for conversation history and lesson state.
+
 Do not send authentication cookies, password data, unnecessary profile
 fields, or unrestricted conversation history.
+
+The backend catalog exposes the teacher inside each subject:
+`GET /api/v1/subjects` returns Mathematics (`subject_math`) with its sole
+teacher (`teacher_math`). The student client selects the subject, not a
+separate teacher endpoint. `POST /api/v1/conversations` accepts that subject ID
+and a client-generated `client_conversation_id` and creates the conversation.
+The client then sends `lesson.start` over its authenticated backend WebSocket;
+the backend persists the opening lesson. Student message retries use a UUID
+`client_message_id`; the backend namespaces it with the conversation ID before
+sending it as the AI idempotency key.
 
 ### 9.3 Internal response
 
@@ -1459,6 +1596,17 @@ fields, or unrestricted conversation history.
   },
   "model": {
     "logical_route": "tutoring_standard"
+  },
+  "lesson_progress": {
+    "topic": "Fractions",
+    "phase": "checking_understanding",
+    "understanding": "not_assessed",
+    "next_action": "ask_question"
+  },
+  "policy_versions": {
+    "safety": "1",
+    "teacher": "math-3",
+    "retrieval": "2"
   }
 }
 ```
@@ -1466,21 +1614,83 @@ fields, or unrestricted conversation history.
 The AI service should not need to expose raw provider details to the
 frontend. The backend may store provider metadata privately for operations.
 
-### 9.4 Streaming
+For terminal failures, return a stable error envelope:
 
-For streaming:
+```json
+{
+  "error": {
+    "code": "AI_PROVIDER_TIMEOUT",
+    "message": "The AI provider did not respond within the allowed time.",
+    "retryable": true,
+    "request_id": "req_01..."
+  }
+}
+```
 
-1. The backend creates a pending assistant message.
-2. The backend opens an authenticated stream to the AI service.
-3. The backend forwards validated deltas to the frontend.
-4. The backend persists the completed content and terminal status.
-5. On cancellation or provider failure, the backend persists an interrupted
-   or failed status and emits a safe terminal event.
+Use `AI_PROVIDER_TIMEOUT` for provider deadlines, `AI_PROVIDER_UNAVAILABLE`
+for provider/service outages, `AI_POLICY_BLOCKED` when policy prevents a
+response, `AI_INVALID_REQUEST` for contract or budget violations, and
+`AI_INTERNAL_ERROR` for other AI-service failures. Never include raw provider
+payloads, hidden prompts, or secrets in errors.
 
-A stream is not complete until the terminal event is received or the backend
-explicitly records a failure.
+### 9.4 Future streaming over the WebSocket boundary
 
-### 9.5 AI error mapping
+This streaming design is a follow-up to the JSON-first integration above. It
+requires coordinated changes to the backend AI client and student-facing
+WebSocket before it is used.
+
+The browser-to-backend live connection is WebSocket. The backend-to-AI
+connection remains authenticated HTTP with server-sent events (SSE); do not
+open a second browser-to-AI connection. The AI stream uses these events:
+
+```text
+event: run.started
+data: {"run_id":"run_01..."}
+
+event: content.delta
+data: {"run_id":"run_01...","text":"A fraction is..."}
+
+event: run.completed
+data: { ...the complete 9.3 response envelope... }
+
+event: run.failed
+data: { ...the stable AI error envelope... }
+```
+
+Only one terminal event (`run.completed` or `run.failed`) is allowed. Content
+deltas must pass the AI service's streaming safety checks before release; if
+safe incremental validation is unavailable, buffer the answer and send only
+the terminal result. The backend persists the pending assistant message before
+the AI call, forwards validated deltas as `assistant.delta` WebSocket events,
+then persists the final response before emitting `message.completed`. On
+provider failure, timeout, or cancellation, persist an explicit failed or
+interrupted state and emit a safe terminal event. A disconnect must not turn a
+pending record into a success or create a duplicate on reconnect.
+
+### 9.5 Turn-based voice over WebSocket
+
+The first voice mode is turn-based. The browser sends `voice.turn.start`
+(including a stable `client_turn_id`, language, and allow-listed audio
+format), binary audio frames, then `voice.turn.end` to the backend WebSocket.
+The backend enforces audio size/duration limits and calls the AI service using
+authenticated internal HTTP:
+
+1. Transcribe the bounded audio and return the transcript.
+2. Send the transcript through the same `lesson_turn` contract, grade-aware
+   teacher policy, context selection, and retrieval policy.
+3. Synthesize the final teacher text using the configured voice.
+4. Relay transcript, teacher text, and audio chunks over the backend
+   WebSocket; persist the transcript and teacher text as messages.
+
+Expose transcription and synthesis through the AI service's internal voice
+routes; provider keys remain in the AI service. Specify accepted codecs,
+maximum duration/bytes, and audio chunk framing in the versioned voice
+contract before implementation. Raw student audio is transient and is not
+cached; retain it only with explicit product need, consent, and a documented
+retention policy. Exact retry handling uses `client_turn_id` and a request
+fingerprint, not audio similarity.
+
+### 9.6 AI error mapping
 
 Map internal errors to stable backend codes:
 
